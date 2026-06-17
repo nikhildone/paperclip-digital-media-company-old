@@ -5,10 +5,10 @@ packages:
   # Keep sandbox-provider plugins installable as standalone packages without
   # forcing root pnpm-lock.yaml churn for their third-party deps.
   - "!packages/plugins/sandbox-providers/**"
-  - packages/plugins/examples/*
-  # Keep this smoke fixture installable as a local plugin example without
-  # forcing PRs to commit pnpm-lock.yaml for a new workspace importer.
-  - "!packages/plugins/examples/plugin-orchestration-smoke-example"
+  # Plugin examples are development and smoke-test fixtures.
+  # They are excluded from the production Docker workspace so Render does not
+  # build example packages during pnpm -r build.
+  - "!packages/plugins/examples/**"
   - server
   - ui
   - cli
