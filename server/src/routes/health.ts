@@ -83,6 +83,23 @@ async function insertSupabaseRows(table: string, rows: Array<Record<string, unkn
   return { ok: false, error: await response.text() };
 }
 
+const defaultBulkTopics = [
+  "SINK DINK India me family pressure aur personal freedom",
+  "Good news kab doge pressure ka calm reply",
+  "Indian couple ka financial peace before baby decision",
+  "No kids by choice ko selfish samajhne wali society",
+  "Marriage me apna timeline choose karna wrong nahi hai",
+];
+
+function parsePositiveNumber(value: unknown, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
+  return value;
+}
+
+function parseString(value: unknown, fallback: string): string {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback;
+}
+
 export function healthRoutes(
   db?: Db,
   opts: {
@@ -190,15 +207,9 @@ export function healthRoutes(
     }
 
     const body = (req.body ?? {}) as Record<string, unknown>;
-    const topic = typeof body.topic === "string" && body.topic.trim().length > 0
-      ? body.topic.trim()
-      : "SINK DINK India test topic";
-    const tone = typeof body.tone === "string" && body.tone.trim().length > 0
-      ? body.tone.trim()
-      : "respectful Hinglish";
-    const durationSec = typeof body.durationSec === "number" && Number.isFinite(body.durationSec)
-      ? body.durationSec
-      : 25;
+    const topic = parseString(body.topic, "SINK DINK India test topic");
+    const tone = parseString(body.tone, "respectful Hinglish");
+    const durationSec = parsePositiveNumber(body.durationSec, 25);
 
     try {
       const workerResponse = await fetch(`${workerUrl}/create`, {
@@ -270,6 +281,134 @@ export function healthRoutes(
         publishingBlocked: true,
       });
     }
+  });
+
+  router.post("/sink-dink/remote-worker/bulk-create", async (req, res) => {
+    const workerUrl = getMediaWorkerUrl();
+    if (!workerUrl) {
+      res.status(503).json({
+        ok: false,
+        error: "MEDIA_WORKER_URL is not configured",
+        humanApprovalRequired: true,
+        publishingBlocked: true,
+      });
+      return;
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const requestedTopics = Array.isArray(body.topics)
+      ? body.topics
+          .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+          .map((value) => value.trim())
+      : [];
+
+    const topics = (requestedTopics.length > 0 ? requestedTopics : defaultBulkTopics).slice(0, 10);
+    const tone = parseString(body.tone, "smart Hinglish, relatable, Instagram friendly");
+    const durationSec = parsePositiveNumber(body.durationSec, 25);
+    const batchId = `batch-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`;
+    const results: Array<Record<string, unknown>> = [];
+
+    for (const [index, topic] of topics.entries()) {
+      try {
+        const workerResponse = await fetch(`${workerUrl}/create`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            topic,
+            tone,
+            durationSec,
+          }),
+        });
+
+        const workerPayload = await workerResponse.json().catch(async () => ({
+          raw: await workerResponse.text().catch(() => ""),
+        })) as Record<string, unknown>;
+        const jobId = typeof workerPayload.jobId === "string" ? workerPayload.jobId : null;
+        const files = normalizeWorkerFiles(workerUrl, workerPayload);
+
+        const supabaseJobs = jobId
+          ? await insertSupabaseRows("sink_dink_jobs", [{
+              job_id: jobId,
+              source: "paperclip",
+              worker: "huggingface",
+              topic,
+              status: typeof workerPayload.status === "string" ? workerPayload.status : "created",
+              files,
+              qa: { workerHttpStatus: workerResponse.status, batchId, batchIndex: index + 1 },
+              approval_status: "pending_human_approval",
+            }])
+          : { ok: true, skipped: true };
+
+        const supabaseAudit = jobId
+          ? await insertSupabaseRows("sink_dink_audit_log", [{
+              event_type: "remote_worker_bulk_item_create",
+              job_id: jobId,
+              actor: "paperclip-render",
+              details: {
+                batchId,
+                batchIndex: index + 1,
+                batchSize: topics.length,
+                topic,
+                tone,
+                durationSec,
+                workerUrl,
+                workerHttpStatus: workerResponse.status,
+              },
+            }])
+          : { ok: true, skipped: true };
+
+        results.push({
+          ok: workerResponse.ok,
+          batchId,
+          batchIndex: index + 1,
+          topic,
+          jobId,
+          remoteStatus: workerPayload.status ?? null,
+          videoCreated: workerPayload.videoCreated ?? null,
+          workerHttpStatus: workerResponse.status,
+          files,
+          supabase: {
+            jobs: supabaseJobs,
+            audit: supabaseAudit,
+          },
+        });
+      } catch (error) {
+        results.push({
+          ok: false,
+          batchId,
+          batchIndex: index + 1,
+          topic,
+          error: error instanceof Error ? error.message : "remote_worker_bulk_item_failed",
+        });
+      }
+    }
+
+    await insertSupabaseRows("sink_dink_audit_log", [{
+      event_type: "remote_worker_bulk_create_summary",
+      job_id: batchId,
+      actor: "paperclip-render",
+      details: {
+        batchId,
+        requestedCount: topics.length,
+        successCount: results.filter((item) => item.ok === true).length,
+        failedCount: results.filter((item) => item.ok !== true).length,
+        tone,
+        durationSec,
+      },
+    }]);
+
+    res.json({
+      ok: results.every((item) => item.ok === true),
+      service: "sink-dink-remote-worker-bridge",
+      mode: "bulk-create",
+      batchId,
+      count: topics.length,
+      successCount: results.filter((item) => item.ok === true).length,
+      failedCount: results.filter((item) => item.ok !== true).length,
+      results,
+      humanApprovalRequired: true,
+      publishingBlocked: true,
+    });
   });
 
   router.get("/", async (req, res) => {
