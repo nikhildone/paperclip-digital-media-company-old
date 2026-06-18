@@ -77,6 +77,7 @@ def make_slide(path: Path, title: str, body: str, footer: str):
     img.save(path)
 
 def make_cover_svg(path: Path, pack: dict):
+    title = html.escape(pack["hook"])
     topic = html.escape(pack["topic"])
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1920" viewBox="0 0 1080 1920">
   <rect width="1080" height="1920" fill="#121216"/>
@@ -111,7 +112,7 @@ def render_video(job_dir: Path, slide_paths: list[Path], total_seconds: int) -> 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "sink-dink-media-worker", "mode": "media_pack_v2_stable", "time": datetime.utcnow().isoformat()}
+    return {"ok": True, "service": "sink-dink-media-worker", "mode": "media_pack_v2", "time": datetime.utcnow().isoformat()}
 
 @app.post("/create")
 def create(req: CreateRequest):
@@ -139,7 +140,7 @@ def create(req: CreateRequest):
         make_slide(slide, pack.get("hook", "SINK DINK India"), line, "Human approval required")
         slide_paths.append(slide)
     (job_dir / "cover.png").write_bytes(slide_paths[0].read_bytes())
-    qa = "# QA Report\n\nStatus: generated_media_pack_v2_stable\n\nPublishing: blocked until human approval.\n\nFiles include script, caption, hashtags, storyboard, cover image and final reel mp4.\n"
+    qa = "# QA Report\n\nStatus: generated_media_pack_v2\n\nPublishing: blocked until human approval.\n\nFiles include script, caption, hashtags, storyboard, cover image and final reel mp4.\n"
     (job_dir / "qa_report.md").write_text(qa, encoding="utf-8")
     video_ok = True
     try:
@@ -155,7 +156,7 @@ def create(req: CreateRequest):
     return {
         "ok": True,
         "jobId": job_id,
-        "status": "completed_media_pack_v2_stable" if video_ok else "completed_without_video",
+        "status": "completed_media_pack_v2" if video_ok else "completed_without_video",
         "videoCreated": video_ok,
         "humanApprovalRequired": True,
         "publishingBlocked": True,
