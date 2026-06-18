@@ -19,9 +19,20 @@ function parsePositiveNumber(value: unknown, fallback: number): number {
   return value;
 }
 
+function originOnly(rawUrl: string | null): string | null {
+  if (!rawUrl) return null;
+  try {
+    return new URL(rawUrl).origin;
+  } catch {
+    return null;
+  }
+}
+
 function resolveSelfOrigin(req: Request): string {
   const configured = normalizeBaseUrl(process.env.PAPERCLIP_PUBLIC_URL ?? process.env.RENDER_EXTERNAL_URL ?? process.env.PUBLIC_BASE_URL);
-  if (configured) return configured;
+  const configuredOrigin = originOnly(configured);
+  if (configuredOrigin) return configuredOrigin;
+
   const protocol = req.headers["x-forwarded-proto"]?.toString().split(",")[0]?.trim() || req.protocol || "https";
   const host = req.get("host") || "localhost";
   return `${protocol}://${host}`;
@@ -123,7 +134,8 @@ export function sinkDinkAgentWorkflowRoutes() {
 
     try {
       const origin = resolveSelfOrigin(req);
-      const campaignResponse = await fetch(`${origin}/api/sink-dink/ai-campaign/create`, {
+      const wrappedRoute = `${origin}/api/sink-dink/ai-campaign/create`;
+      const campaignResponse = await fetch(wrappedRoute, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -156,7 +168,7 @@ export function sinkDinkAgentWorkflowRoutes() {
           count,
           tone,
           durationSec,
-          wrappedRoute: "/api/sink-dink/ai-campaign/create",
+          wrappedRoute,
           campaignBatchId: campaign.batchId ?? null,
           campaignHttpStatus: campaignResponse.status,
           successCount,
@@ -181,6 +193,11 @@ export function sinkDinkAgentWorkflowRoutes() {
         approvalStatus: APPROVAL_STATUS,
         workflowTrace,
         campaign,
+        diagnostics: {
+          resolvedOrigin: origin,
+          wrappedRoute,
+          campaignHttpStatus: campaignResponse.status,
+        },
         supabase: { audit: supabaseAudit },
       });
     } catch (error) {
