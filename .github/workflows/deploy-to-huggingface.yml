@@ -8,8 +8,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repo with full history
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Prepare Space README
         run: |
@@ -31,5 +33,6 @@ jobs:
         run: |
           git config --global user.email "github-actions@github.com"
           git config --global user.name "github-actions"
+          git remote remove hf || true
           git remote add hf https://user:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}
           git push --force hf HEAD:main
