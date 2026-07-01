@@ -48,7 +48,7 @@ export function dashboardRoutes(db: Db) {
         })),
       });
     } catch (error) {
-      console.error("Error fetching production status:", error);
+      console.error("Error fetching production status:", error instanceof Error ? error.message : error);
       res.status(500).json({ error: "Failed to fetch production status" });
     }
   });
@@ -128,11 +128,18 @@ export function dashboardRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
 
-      // Determine which API key to use
+      // Determine which API key to use (do not expose or log this value)
       const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
       if (!apiKey) {
         return res.status(500).json({ error: "API key not configured" });
       }
+
+      // Request body options
+      const requestedCount = typeof req.body?.count === "number" ? req.body.count : undefined;
+      const agentLimit = typeof req.body?.agentLimit === "number" ? req.body.agentLimit : undefined;
+      const preferredModel = typeof req.body?.model === "string" && req.body.model.length > 0 ? req.body.model : undefined;
+      const topic = typeof req.body?.topic === "string" && req.body.topic.length > 0 ? req.body.topic : "SINK & DINK India AI Media Organisation";
+      const tone = typeof req.body?.tone === "string" && req.body.tone.length > 0 ? req.body.tone : undefined;
 
       // Fetch all agents for this company
       const allAgents = await db
@@ -141,14 +148,31 @@ export function dashboardRoutes(db: Db) {
         .where(eq(agents.companyId, companyId));
 
       // Filter out terminated and pending_approval agents
-      const activeAgents = allAgents.filter(
+      let activeAgents = allAgents.filter(
         (a) => a.status !== "terminated" && a.status !== "pending_approval"
       );
 
+      // Apply agentLimit for testing if provided
+      if (typeof agentLimit === "number" && agentLimit > 0) {
+        activeAgents = activeAgents.slice(0, agentLimit);
+      }
+
+      // Optionally use requestedCount in prompt construction; include in response
+
       // Generate batch ID
       const batchId = `batch-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      const model = "gemini-2.5-flash-lite";
-      const topic = "SINK & DINK India AI Media Organisation";
+
+      // Prepare model candidates (preferred first, then fallbacks)
+      const fallbackModels = [
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash",
+      ];
+
+      const modelCandidates = preferredModel
+        ? Array.from(new Set([preferredModel, ...fallbackModels]))
+        : fallbackModels.slice();
 
       // Prepare outputs array
       const outputs: Array<{
@@ -160,6 +184,8 @@ export function dashboardRoutes(db: Db) {
         status: string;
         output: string;
         error: string | null;
+        modelUsed: string | null;
+        attempts: number;
       }> = [];
 
       // Process agents with concurrency limit of 3
@@ -167,63 +193,122 @@ export function dashboardRoutes(db: Db) {
       let successCount = 0;
       let failureCount = 0;
 
-      // Helper function to run a single agent
+      // Helper function to run a single agent with retries across models for 429/503
       const runAgent = async (agent: typeof agents.$inferSelect) => {
+        let attempts = 0;
+        let ok = false;
+        let lastError: any = null;
+        let usedModel: string | null = null;
+
         try {
           // Get role-specific prompt
           const rolePrompt = getAgentPrompt(agent);
 
-          const prompt = `${topic}
-${rolePrompt}
-Create role-specific work for upload-ready Instagram content packs.
-Provide practical, actionable output that can be directly used in production.
-Format your response as clear bullet points or structured sections.`;
+          // Build base prompt
+          const basePromptParts = [`${topic}`, `${rolePrompt}`, `Create role-specific work for upload-ready Instagram content packs.`];
+          if (typeof requestedCount === "number") {
+            basePromptParts.push(`Create ${requestedCount} distinct content packs.`);
+          }
+          if (tone) {
+            basePromptParts.push(`Tone: ${tone}`);
+          }
+          basePromptParts.push("Provide practical, actionable output that can be directly used in production. Format your response as clear bullet points or structured sections.");
 
-          // Call Google Gemini REST API
-          const geminiUrl =
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent";
+          const prompt = basePromptParts.join("\n");
 
-          const response = await fetch(geminiUrl, {
-            method: "POST",
-            headers: {
-              "X-goog-api-key": apiKey,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              contents: [
-                {
-                  parts: [
+          const maxAttempts = 3;
+
+          for (attempts = 1; attempts <= maxAttempts; attempts++) {
+            // select model for this attempt: use candidate at index attempts-1 if exists, otherwise last candidate
+            const modelIndex = Math.min(attempts - 1, modelCandidates.length - 1);
+            const modelToUse = modelCandidates[modelIndex];
+            usedModel = modelToUse;
+
+            const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+              modelToUse
+            )}:generateContent`;
+
+            let response: Response;
+            try {
+              response = await fetch(geminiUrl, {
+                method: "POST",
+                headers: {
+                  "X-goog-api-key": apiKey,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  contents: [
                     {
-                      text: prompt,
+                      parts: [
+                        {
+                          text: prompt,
+                        },
+                      ],
                     },
                   ],
-                },
-              ],
-            }),
-          });
+                }),
+              });
+            } catch (networkErr) {
+              // Network error: treat as last error and break
+              lastError = networkErr instanceof Error ? networkErr.message : String(networkErr);
+              break;
+            }
 
-          if (!response.ok) {
-            const errorData = await response.text();
-            throw new Error(`Gemini API error: ${response.status} - ${errorData}`);
+            if (response.ok) {
+              const data = (await response.json()) as {
+                candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+              };
+              const generatedText = data.candidates?.[0]?.content?.parts?.[0]?.text || "No output generated";
+
+              ok = true;
+
+              outputs.push({
+                agentId: agent.id,
+                agentName: agent.name,
+                role: agent.role,
+                title: agent.title || null,
+                ok: true,
+                status: "completed",
+                output: generatedText,
+                error: null,
+                modelUsed: usedModel,
+                attempts,
+              });
+
+              successCount++;
+              break; // successful
+            } else {
+              // Non-OK response: inspect status code
+              const statusCode = response.status;
+              const errorText = await response.text();
+              lastError = `Gemini API error: ${statusCode} - ${errorText}`;
+
+              // Retry only for 429 or 503
+              if (statusCode === 429 || statusCode === 503) {
+                // continue to next attempt (which may try a different model)
+                continue;
+              } else {
+                // Non-retriable error
+                break;
+              }
+            }
           }
 
-          const data = (await response.json()) as {
-            candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-          };
-          const generatedText =
-            data.candidates?.[0]?.content?.parts?.[0]?.text || "No output generated";
-
-          successCount++;
-          outputs.push({
-            agentId: agent.id,
-            agentName: agent.name,
-            role: agent.role,
-            title: agent.title || null,
-            ok: true,
-            status: "completed",
-            output: generatedText,
-            error: null,
-          });
+          if (!ok) {
+            failureCount++;
+            outputs.push({
+              agentId: agent.id,
+              agentName: agent.name,
+              role: agent.role,
+              title: agent.title || null,
+              ok: false,
+              status: "failed",
+              output: "",
+              error: lastError instanceof Error ? lastError.message : String(lastError),
+              modelUsed: usedModel,
+              attempts: attempts > 0 ? attempts - 1 : 0,
+            });
+          }
         } catch (error) {
           failureCount++;
           const errorMessage = error instanceof Error ? error.message : String(error);
@@ -236,6 +321,8 @@ Format your response as clear bullet points or structured sections.`;
             status: "failed",
             output: "",
             error: errorMessage,
+            modelUsed: usedModel,
+            attempts,
           });
         }
       };
@@ -246,18 +333,37 @@ Format your response as clear bullet points or structured sections.`;
         await Promise.all(batch.map((agent) => runAgent(agent)));
       }
 
-      res.json({
+      // Determine overall status and HTTP code
+      let overallStatus = "ok";
+      if (successCount === 0) {
+        overallStatus = "failed";
+      } else if (failureCount > 0) {
+        overallStatus = "partial";
+      }
+
+      const responsePayload = {
         batchId,
         companyId,
-        model,
-        topic,
+        requestedCount: requestedCount ?? null,
         count: activeAgents.length,
+        agentLimit: agentLimit ?? null,
+        modelPreference: preferredModel ?? null,
+        topic,
         successfulAgents: successCount,
         failedAgents: failureCount,
+        totalAgents: activeAgents.length,
+        status: overallStatus,
         outputs,
-      });
+      } as const;
+
+      if (overallStatus === "failed") {
+        // All agents failed: return 503 Service Unavailable
+        return res.status(503).json(responsePayload);
+      }
+
+      res.json(responsePayload);
     } catch (error) {
-      console.error("Error starting production batch:", error);
+      console.error("Error starting production batch:", error instanceof Error ? error.message : error);
       res.status(500).json({ error: "Failed to start production batch" });
     }
   });
