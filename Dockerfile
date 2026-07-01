@@ -39,8 +39,7 @@ COPY packages/adapters/pi-local/package.json packages/adapters/pi-local/
 COPY packages/plugins/sdk/package.json packages/plugins/sdk/
 COPY --parents packages/plugins/sandbox-providers/./*/package.json packages/plugins/sandbox-providers/
 COPY packages/plugins/paperclip-plugin-fake-sandbox/package.json packages/plugins/paperclip-plugin-fake-sandbox/
-COPY packages/plugins/plugin-llm-wiki/package.json packages/plugins/plugin-llm-wiki/
-COPY packages/plugins/plugin-workspace-diff/package.json packages/plugins/plugin-workspace-diff/
+COPY packages/plugins/plugin-llm-wiki/package.json packages/plugins/plugin-workspace-diff/package.json packages/plugins/plugin-workspace-diff/
 COPY patches/ patches/
 COPY scripts/link-plugin-dev-sdk.mjs scripts/
 
@@ -77,6 +76,13 @@ args = sys.argv[1:]
 i = 0
 
 os.environ["GEMINI_SANDBOX"] = "false"
+
+# Gemini CLI exits when both key names are present. Prefer GEMINI_API_KEY for this adapter.
+if os.environ.get("GEMINI_API_KEY"):
+    os.environ.pop("GOOGLE_API_KEY", None)
+elif os.environ.get("GOOGLE_API_KEY"):
+    os.environ["GEMINI_API_KEY"] = os.environ["GOOGLE_API_KEY"]
+    os.environ.pop("GOOGLE_API_KEY", None)
 
 while i < len(args):
     arg = args[i]
