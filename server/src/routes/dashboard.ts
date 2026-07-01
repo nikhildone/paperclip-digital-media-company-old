@@ -2,6 +2,8 @@ import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import { dashboardService } from "../services/dashboard.js";
 import { assertCompanyAccess } from "./authz.js";
+import { eq, and } from "drizzle-orm";
+import { agents } from "@paperclipai/db";
 
 export function dashboardRoutes(db: Db) {
   const router = Router();
@@ -12,6 +14,221 @@ export function dashboardRoutes(db: Db) {
     assertCompanyAccess(req, companyId);
     const summary = await svc.summary(companyId);
     res.json(summary);
+  });
+
+  /**
+   * GET /companies/:companyId/sink-dink/production/status
+   * Returns the production status for SINK & DINK India AI Media Organisation.
+   */
+  router.get("/companies/:companyId/sink-dink/production/status", async (req, res) => {
+    try {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+
+      // Fetch all agents for this company, excluding terminated and pending_approval
+      const agentRows = await db
+        .select()
+        .from(agents)
+        .where(
+          and(
+            eq(agents.companyId, companyId),
+            db.query(agents).where(
+              and(
+                eq(agents.status, "terminated"),
+                eq(agents.status, "pending_approval")
+              )
+            ).noop()
+          )
+        );
+
+      // Better query: fetch all and filter in memory
+      const allAgents = await db
+        .select()
+        .from(agents)
+        .where(eq(agents.companyId, companyId));
+
+      const activeAgents = allAgents.filter(
+        (a) => a.status !== "terminated" && a.status !== "pending_approval"
+      );
+
+      res.json({
+        companyId,
+        status: "ready",
+        totalAgents: activeAgents.length,
+        agents: activeAgents.map((a) => ({
+          id: a.id,
+          name: a.name,
+          role: a.role,
+          status: a.status,
+        })),
+      });
+    } catch (error) {
+      console.error("Error fetching production status:", error);
+      res.status(500).json({ error: "Failed to fetch production status" });
+    }
+  });
+
+  /**
+   * POST /companies/:companyId/sink-dink/production/start
+   * Starts production agent runs using Google Gemini REST API directly.
+   * Returns batch results with outputs from each agent.
+   */
+  router.post("/companies/:companyId/sink-dink/production/start", async (req, res) => {
+    try {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+
+      // Determine which API key to use
+      const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+      if (!apiKey) {
+        return res.status(500).json({ error: "API key not configured" });
+      }
+
+      // Fetch all agents for this company, excluding terminated and pending_approval
+      const allAgents = await db
+        .select()
+        .from(agents)
+        .where(eq(agents.companyId, companyId));
+
+      const activeAgents = allAgents.filter(
+        (a) => a.status !== "terminated" && a.status !== "pending_approval"
+      );
+
+      // Generate batch ID
+      const batchId = `batch-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      const model = "gemini-2.5-flash-lite";
+      const topic = "SINK & DINK India AI Media Organisation";
+
+      // Prepare outputs array
+      const outputs: Array<{
+        agentId: string;
+        agentName: string;
+        role: string;
+        title: string | null;
+        ok: boolean;
+        status: string;
+        output: string;
+        error: string | null;
+      }> = [];
+
+      // Process agents with concurrency limit of 3
+      const concurrencyLimit = 3;
+      let successCount = 0;
+      let failureCount = 0;
+
+      // Helper function to run a single agent
+      const runAgent = async (agent: typeof agents.$inferSelect) => {
+        try {
+          // Build prompt based on agent role
+          const rolePrompts: Record<string, string> = {
+            "ceo":
+              "You are the CEO. Coordinate and merge work from all team members into a cohesive upload-ready Instagram content pack.",
+            "research":
+              "You are the Research role. Create an audience pain map and identify trend angles for the content.",
+            "strategy":
+              "You are the Strategy role. Create content pillars and positioning strategy.",
+            "content":
+              "You are the Content role. Create hooks, scripts, captions, CTAs, and relevant hashtags.",
+            "media_production":
+              "You are the Media Production role. Create scene direction, on-screen text overlays, and thumbnail specifications.",
+            "qa":
+              "You are the QA role. Provide brand safety assessment and upload-readiness score.",
+            "automation":
+              "You are the Automation role. Document repeatable workflow, dashboard notes, and API integration points.",
+            "memory":
+              "You are the Memory role. Create reusable memory templates, content backlog, and reference materials.",
+            "growth":
+              "You are the Growth role. Define growth loops, CTAs, monetization strategy, and page positioning.",
+          };
+
+          const rolePrompt = rolePrompts[agent.role] || rolePrompts["content"];
+
+          const prompt = `${topic}
+${rolePrompt}
+Create role-specific work for upload-ready Instagram content packs.
+Provide practical, actionable output that can be directly used in production.
+Format your response as clear bullet points or structured sections.`;
+
+          // Call Google Gemini REST API
+          const geminiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent";
+
+          const response = await fetch(geminiUrl, {
+            method: "POST",
+            headers: {
+              "X-goog-api-key": apiKey,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              contents: [
+                {
+                  parts: [
+                    {
+                      text: prompt,
+                    },
+                  ],
+                },
+              ],
+            }),
+          });
+
+          if (!response.ok) {
+            const errorData = await response.text();
+            throw new Error(`Gemini API error: ${response.status} - ${errorData}`);
+          }
+
+          const data = (await response.json()) as {
+            candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+          };
+          const generatedText =
+            data.candidates?.[0]?.content?.parts?.[0]?.text || "No output generated";
+
+          successCount++;
+          outputs.push({
+            agentId: agent.id,
+            agentName: agent.name,
+            role: agent.role,
+            title: agent.title || null,
+            ok: true,
+            status: "completed",
+            output: generatedText,
+            error: null,
+          });
+        } catch (error) {
+          failureCount++;
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          outputs.push({
+            agentId: agent.id,
+            agentName: agent.name,
+            role: agent.role,
+            title: agent.title || null,
+            ok: false,
+            status: "failed",
+            output: "",
+            error: errorMessage,
+          });
+        }
+      };
+
+      // Run agents with concurrency limit
+      for (let i = 0; i < activeAgents.length; i += concurrencyLimit) {
+        const batch = activeAgents.slice(i, i + concurrencyLimit);
+        await Promise.all(batch.map((agent) => runAgent(agent)));
+      }
+
+      res.json({
+        batchId,
+        companyId,
+        model,
+        topic,
+        count: activeAgents.length,
+        successfulAgents: successCount,
+        failedAgents: failureCount,
+        outputs,
+      });
+    } catch (error) {
+      console.error("Error starting production batch:", error);
+      res.status(500).json({ error: "Failed to start production batch" });
+    }
   });
 
   return router;
