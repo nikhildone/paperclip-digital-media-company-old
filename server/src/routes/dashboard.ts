@@ -3,7 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { dashboardService } from "../services/dashboard.js";
 import { assertCompanyAccess } from "./authz.js";
 import { eq } from "drizzle-orm";
-import { agents } from "@paperclipai/db";
+import { agents, heartbeatRuns } from "@paperclipai/db";
 
 export function dashboardRoutes(db: Db) {
   const router = Router();
@@ -118,10 +118,57 @@ export function dashboardRoutes(db: Db) {
     return "You are a team member of SINK & DINK India AI Media Organisation. Create role-specific work for upload-ready Instagram content packs. Provide practical, actionable output.";
   }
 
+  function readPositiveNumber(value: unknown): number | undefined {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+    return Math.floor(value);
+  }
+
+  function buildDashboardRunLog(input: {
+    batchId: string;
+    status: string;
+    successfulAgents: number;
+    failedAgents: number;
+    outputs: Array<{
+      agentName: string;
+      role: string;
+      ok: boolean;
+      status: string;
+      output: string;
+      error: string | null;
+      modelUsed: string | null;
+      attempts: number;
+    }>;
+  }) {
+    const header = [
+      `SINK DINK Direct Production Batch: ${input.batchId}`,
+      `Status: ${input.status}`,
+      `Successful agents: ${input.successfulAgents}`,
+      `Failed agents: ${input.failedAgents}`,
+    ].join("\n");
+
+    const body = input.outputs.map((output, index) => {
+      const content = output.ok ? output.output : `ERROR: ${output.error ?? "Unknown error"}`;
+      return [
+        `## ${index + 1}. ${output.agentName} (${output.role})`,
+        `Status: ${output.status}`,
+        `Model: ${output.modelUsed ?? "unknown"}`,
+        `Attempts: ${output.attempts}`,
+        "",
+        content,
+      ].join("\n");
+    }).join("\n\n---\n\n");
+
+    return `${header}\n\n${body}`;
+  }
+
   /**
    * POST /companies/:companyId/sink-dink/production/start
    * Starts production agent runs using Google Gemini REST API directly.
    * Returns batch results with outputs from each agent.
+   *
+   * When `recordRunForAgentId` and `returnRun` are provided, this also writes a
+   * completed heartbeat_runs row and returns that row, so the existing Paperclip
+   * dashboard Run now button can show output without adding any extra UI button.
    */
   router.post("/companies/:companyId/sink-dink/production/start", async (req, res) => {
     try {
@@ -135,11 +182,16 @@ export function dashboardRoutes(db: Db) {
       }
 
       // Request body options
-      const requestedCount = typeof req.body?.count === "number" ? req.body.count : undefined;
-      const agentLimit = typeof req.body?.agentLimit === "number" ? req.body.agentLimit : undefined;
+      const requestedCount = readPositiveNumber(req.body?.count);
+      const agentLimit = readPositiveNumber(req.body?.agentLimit);
+      const requestedConcurrency = readPositiveNumber(req.body?.concurrency);
       const preferredModel = typeof req.body?.model === "string" && req.body.model.length > 0 ? req.body.model : undefined;
       const topic = typeof req.body?.topic === "string" && req.body.topic.length > 0 ? req.body.topic : "SINK & DINK India AI Media Organisation";
       const tone = typeof req.body?.tone === "string" && req.body.tone.length > 0 ? req.body.tone : undefined;
+      const recordRunForAgentId = typeof req.body?.recordRunForAgentId === "string" && req.body.recordRunForAgentId.length > 0
+        ? req.body.recordRunForAgentId
+        : null;
+      const returnRun = req.body?.returnRun === true;
 
       // Fetch all agents for this company
       const allAgents = await db
@@ -152,22 +204,19 @@ export function dashboardRoutes(db: Db) {
         (a) => a.status !== "terminated" && a.status !== "pending_approval"
       );
 
-      // Apply agentLimit for testing if provided
+      // Apply agentLimit for testing/dashboard-safe execution if provided
       if (typeof agentLimit === "number" && agentLimit > 0) {
         activeAgents = activeAgents.slice(0, agentLimit);
       }
 
-      // Optionally use requestedCount in prompt construction; include in response
-
       // Generate batch ID
       const batchId = `batch-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-      // Prepare model candidates (preferred first, then fallbacks)
+      // Keep fallbacks on 2.5 models only. 2.0 free-tier quotas repeatedly returned
+      // limit=0 for this deployment and made full batches fail noisily.
       const fallbackModels = [
         "gemini-2.5-flash-lite",
         "gemini-2.5-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-2.0-flash",
       ];
 
       const modelCandidates = preferredModel
@@ -188,8 +237,8 @@ export function dashboardRoutes(db: Db) {
         attempts: number;
       }> = [];
 
-      // Process agents with concurrency limit of 3
-      const concurrencyLimit = 3;
+      // Process agents with conservative concurrency by default to reduce free-tier 429s.
+      const concurrencyLimit = Math.max(1, Math.min(requestedConcurrency ?? 1, 3));
       let successCount = 0;
       let failureCount = 0;
 
@@ -216,12 +265,11 @@ export function dashboardRoutes(db: Db) {
 
           const prompt = basePromptParts.join("\n");
 
-          const maxAttempts = 3;
+          const maxAttempts = modelCandidates.length;
 
           for (attempts = 1; attempts <= maxAttempts; attempts++) {
-            // select model for this attempt: use candidate at index attempts-1 if exists, otherwise last candidate
-            const modelIndex = Math.min(attempts - 1, modelCandidates.length - 1);
-            const modelToUse = modelCandidates[modelIndex];
+            // select model for this attempt: use candidate at index attempts-1
+            const modelToUse = modelCandidates[attempts - 1];
             usedModel = modelToUse;
 
             const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
@@ -285,7 +333,7 @@ export function dashboardRoutes(db: Db) {
 
               // Retry only for 429 or 503
               if (statusCode === 429 || statusCode === 503) {
-                // continue to next attempt (which may try a different model)
+                // continue to next 2.5 model candidate
                 continue;
               } else {
                 // Non-retriable error
@@ -306,7 +354,7 @@ export function dashboardRoutes(db: Db) {
               output: "",
               error: lastError instanceof Error ? lastError.message : String(lastError),
               modelUsed: usedModel,
-              attempts: attempts > 0 ? attempts - 1 : 0,
+              attempts,
             });
           }
         } catch (error) {
@@ -355,6 +403,59 @@ export function dashboardRoutes(db: Db) {
         status: overallStatus,
         outputs,
       } as const;
+
+      if (recordRunForAgentId && returnRun) {
+        const targetAgent = allAgents.find((agent) => agent.id === recordRunForAgentId && agent.companyId === companyId);
+        if (!targetAgent || targetAgent.status === "terminated" || targetAgent.status === "pending_approval") {
+          return res.status(404).json({ error: "Target agent not found or inactive" });
+        }
+
+        const now = new Date();
+        const stdoutExcerpt = buildDashboardRunLog({
+          batchId,
+          status: overallStatus,
+          successfulAgents: successCount,
+          failedAgents: failureCount,
+          outputs,
+        });
+        const firstFailure = outputs.find((output) => !output.ok);
+        const runStatus = overallStatus === "failed" ? "failed" : "succeeded";
+
+        const run = await db.insert(heartbeatRuns).values({
+          companyId,
+          agentId: targetAgent.id,
+          invocationSource: "on_demand",
+          triggerDetail: "manual",
+          status: runStatus,
+          startedAt: now,
+          processStartedAt: now,
+          finishedAt: now,
+          lastOutputAt: now,
+          lastOutputSeq: 1,
+          lastOutputStream: "stdout",
+          stdoutExcerpt,
+          stderrExcerpt: firstFailure?.error ?? null,
+          error: overallStatus === "failed" ? firstFailure?.error ?? "SINK DINK direct production failed" : null,
+          errorCode: overallStatus === "failed" ? "sink_dink_direct_production_failed" : null,
+          externalRunId: batchId,
+          resultJson: {
+            sinkDinkDirectProduction: true,
+            dashboardInvoke: true,
+            responsePayload,
+          },
+          contextSnapshot: {
+            triggeredBy: "dashboard_direct_production",
+            requestedCount: requestedCount ?? null,
+            agentLimit: agentLimit ?? null,
+            successfulAgents: successCount,
+            failedAgents: failureCount,
+            status: overallStatus,
+          },
+          updatedAt: now,
+        }).returning().then((rows) => rows[0]);
+
+        return res.status(202).json(run);
+      }
 
       if (overallStatus === "failed") {
         // All agents failed: return 503 Service Unavailable
