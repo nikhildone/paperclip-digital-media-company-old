@@ -17,7 +17,6 @@ import type {
   IssueRetryNowResponse,
   IssueThreadInteraction,
   IssueTreeControlPreview,
-  IssueTreeHold,
   IssueWatchdog,
   IssueWorkProduct,
   PreviewIssueTreeControl,
@@ -26,6 +25,77 @@ import type {
   UpsertIssueDocument,
 } from "@paperclipai/shared";
 import { api } from "./client";
+
+type SinkDinkDirectRun = {
+  id?: string;
+  status?: string;
+  stdoutExcerpt?: string | null;
+  externalRunId?: string | null;
+  resultJson?: {
+    sinkDinkDirectProduction?: boolean;
+    responsePayload?: {
+      status?: string;
+      successfulAgents?: number;
+      failedAgents?: number;
+    };
+  } | null;
+};
+
+const SINK_DINK_COMPANY_ID = "fec0393e-a8dc-49c7-84a9-2ac6495a9223";
+const SINK_DINK_CEO_AGENT_ID = "603df504-b60c-43ea-856c-8b3a50eca153";
+const SINK_DINK_DEFAULT_TONE = "simple Hinglish, Indian Instagram reel style, emotional but practical, upload-ready, clear sections";
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function buildSinkDinkIssueTopic(issue: Issue, input: Record<string, unknown>) {
+  const rawTitle = readString(issue.title) ?? readString(input.title) ?? "Create one upload-ready SINK DINK content pack";
+  const rawDescription = readString(issue.description) ?? readString(input.description);
+  return [
+    `Task: ${rawTitle}`,
+    rawDescription ? `Details: ${rawDescription}` : null,
+    "Create upload-ready Instagram post/reel content for Indian SINK DINK couples.",
+    "CEO should coordinate with relevant agents and return final usable content pack.",
+  ].filter((part): part is string => Boolean(part)).join("\n");
+}
+
+async function runSinkDinkProductionForIssue(companyId: string, issue: Issue, input: Record<string, unknown>) {
+  const assigneeAgentId = readString(input.assigneeAgentId) ?? issue.assigneeAgentId ?? SINK_DINK_CEO_AGENT_ID;
+  const run = await api.post<SinkDinkDirectRun>(`/companies/${companyId}/sink-dink/production/start`, {
+    count: 3,
+    agentLimit: 3,
+    concurrency: 1,
+    model: "gemini-2.5-flash-lite",
+    topic: buildSinkDinkIssueTopic(issue, input),
+    tone: readString(input.tone) ?? SINK_DINK_DEFAULT_TONE,
+    recordRunForAgentId: assigneeAgentId,
+    returnRun: true,
+  });
+
+  const output = readString(run.stdoutExcerpt);
+  if (output) {
+    await api.post<IssueComment>(`/issues/${issue.id}/comments`, {
+      body: [
+        "## CEO Production Output",
+        "",
+        output,
+      ].join("\n"),
+    }).catch((error) => {
+      console.warn("Failed to attach SINK DINK production output to issue", error);
+    });
+  }
+
+  if (run.status === "succeeded") {
+    await api.patch<IssueUpdateResponse>(`/issues/${issue.id}`, {
+      status: "done",
+    }).catch((error) => {
+      console.warn("Failed to mark SINK DINK issue done after production", error);
+    });
+  }
+
+  return run;
+}
 
 export type IssueUpdateResponse = Issue & {
   comment?: IssueComment | null;
@@ -137,8 +207,15 @@ export const issuesApi = {
     api.post<{ id: string; archivedAt: Date }>(`/issues/${id}/inbox-archive`, {}),
   unarchiveFromInbox: (id: string) =>
     api.delete<{ id: string; archivedAt: Date } | { ok: true }>(`/issues/${id}/inbox-archive`),
-  create: (companyId: string, data: Record<string, unknown>) =>
-    api.post<Issue>(`/companies/${companyId}/issues`, data),
+  create: async (companyId: string, data: Record<string, unknown>) => {
+    const issue = await api.post<Issue>(`/companies/${companyId}/issues`, data);
+    if (companyId === SINK_DINK_COMPANY_ID) {
+      await runSinkDinkProductionForIssue(companyId, issue, data).catch((error) => {
+        console.warn("SINK DINK direct production after issue creation failed", error);
+      });
+    }
+    return issue;
+  },
   update: (id: string, data: Record<string, unknown>) =>
     api.patch<IssueUpdateResponse>(`/issues/${id}`, data),
   resolveRecoveryAction: (
