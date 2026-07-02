@@ -86,6 +86,41 @@ export interface AgentWakeRequest {
   forceFreshSession?: boolean;
 }
 
+const SINK_DINK_COMPANY_ID = "fec0393e-a8dc-49c7-84a9-2ac6495a9223";
+const SINK_DINK_CEO_AGENT_ID = "603df504-b60c-43ea-856c-8b3a50eca153";
+const SINK_DINK_DEFAULT_TOPIC = "Indian SINK DINK couples: family pressure, financial freedom, peaceful no-kids life, relationship bond, society pressure, money peace, travel freedom, personal growth";
+const SINK_DINK_DEFAULT_TONE = "simple Hinglish, Indian Instagram reel style, emotional but practical, upload-ready, clear sections";
+
+function readPositiveNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  return Math.floor(value);
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function buildSinkDinkDashboardRunPayload(agentId: string, data: AgentWakeRequest = {}) {
+  const payload = data.payload && typeof data.payload === "object" && !Array.isArray(data.payload)
+    ? data.payload
+    : {};
+  const requestedCount = readPositiveNumber(payload.count);
+  const requestedAgentLimit = readPositiveNumber(payload.agentLimit);
+  const isCeoRun = agentId === SINK_DINK_CEO_AGENT_ID;
+  const safeDefaultLimit = isCeoRun ? 3 : 1;
+
+  return {
+    count: requestedCount ?? requestedAgentLimit ?? safeDefaultLimit,
+    agentLimit: requestedAgentLimit ?? safeDefaultLimit,
+    concurrency: readPositiveNumber(payload.concurrency) ?? 1,
+    model: readString(payload.model) ?? "gemini-2.5-flash-lite",
+    topic: readString(payload.topic) ?? SINK_DINK_DEFAULT_TOPIC,
+    tone: readString(payload.tone) ?? SINK_DINK_DEFAULT_TONE,
+    recordRunForAgentId: agentId,
+    returnRun: true,
+  };
+}
+
 function withCompanyScope(path: string, companyId?: string) {
   if (!companyId) return path;
   const separator = path.includes("?") ? "&" : "?";
@@ -118,7 +153,6 @@ export const agentsApi = {
 
       const urlKey = normalizeAgentUrlKey(id);
       if (!urlKey) throw error;
-
       const agents = await api.get<Agent[]>(`/companies/${companyId}/agents`);
       const matches = agents.filter(
         (agent) => agent.status !== "terminated" && normalizeAgentUrlKey(agent.urlKey) === urlKey,
@@ -223,8 +257,15 @@ export const agentsApi = {
       `/companies/${companyId}/adapters/${type}/test-environment`,
       data,
     ),
-  invoke: (id: string, companyId?: string, data: AgentWakeRequest = {}) =>
-    api.post<HeartbeatRun>(agentPath(id, companyId, "/heartbeat/invoke"), data),
+  invoke: (id: string, companyId?: string, data: AgentWakeRequest = {}) => {
+    if (companyId === SINK_DINK_COMPANY_ID) {
+      return api.post<HeartbeatRun>(
+        `/companies/${companyId}/sink-dink/production/start`,
+        buildSinkDinkDashboardRunPayload(id, data),
+      );
+    }
+    return api.post<HeartbeatRun>(agentPath(id, companyId, "/heartbeat/invoke"), data);
+  },
   wakeup: (
     id: string,
     data: AgentWakeRequest,
